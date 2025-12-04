@@ -271,60 +271,117 @@ async def get_ai_recommendation(data_type, formatted_data):
 
     # Try to use google-generativeai (Gemini) first
     try:
-        import google.generativeai as genai
-
-        # Configure client with API key
+        # Try the newer `google.genai` package first (some installs expose this)
         try:
+            import google.genai as genai
+        except Exception:
+            import google.generativeai as genai
+
+        # Configure client with API key (support multiple client versions)
+        try:
+            # many versions expose a configure helper
             genai.configure(api_key=GEMINI_API_KEY)
         except Exception:
-            # Some versions expect top-level api_key assignment
             try:
                 genai.api_key = GEMINI_API_KEY
             except Exception:
                 pass
-
-        # Call the Gemini model in a thread to avoid blocking
+        # Define a single call path that works across common client shapes
         def call_gemini():
-            # Try common names for the text generation method
-            if hasattr(genai, 'generate_text'):
-                try:
-                    return genai.generate_text(model="gemini-2.5-flash", prompt=prompt)
-                except TypeError:
-                    # older/newer signatures may expect 'input' instead of 'prompt'
-                    return genai.generate_text(model="gemini-2.5-flash", input=prompt)
-            # Fallback to any client attribute named 'TextGeneration' or similar
-            if hasattr(genai, 'TextGeneration'):
+            # Preferred helper if available
+            # Newer clients often expose `models.generate_text` or top-level generate_text
+            model_variants = [
+                "models/gemini-2.5-flash",
+                "models/gemini/gemini-2.5-flash",
+                "gemini-2.5-flash",
+            ]
+
+            # Try top-level helper
+            if hasattr(genai, "generate_text"):
+                for mdl in model_variants:
+                    try:
+                        return genai.generate_text(model=mdl, input=prompt)
+                    except TypeError:
+                        try:
+                            return genai.generate_text(model=mdl, prompt=prompt)
+                        except Exception:
+                            continue
+                    except Exception:
+                        continue
+
+            # Try `models.generate_text` shape
+            if hasattr(genai, "models") and hasattr(genai.models, "generate_text"):
+                for mdl in model_variants:
+                    try:
+                        return genai.models.generate_text(model=mdl, input=prompt)
+                    except TypeError:
+                        try:
+                            return genai.models.generate_text(model=mdl, prompt=prompt)
+                        except Exception:
+                            continue
+                    except Exception:
+                        continue
+
+            # Fallback to older TextGeneration client
+            if hasattr(genai, "TextGeneration"):
                 gen = genai.TextGeneration()
-                return gen.generate(model="gemini-2.5-flash", input=prompt)
-            raise RuntimeError("google.generativeai client does not expose a supported generation method")
+                for mdl in model_variants:
+                    try:
+                        return gen.generate(model=mdl, input=prompt)
+                    except Exception:
+                        continue
+
+            raise RuntimeError("google generative client does not expose a supported generation method or model variants failed")
 
         try:
             gen_result = await asyncio.to_thread(call_gemini)
 
-            # Extract text from common response shapes
             if gen_result is None:
                 return "(No response from Gemini)"
 
-            # gen_result may be an object or dict
-            # Try several common attributes
+            # Normalize common response shapes to plain text
             text = None
-            if hasattr(gen_result, 'output') and isinstance(gen_result.output, str):
-                text = gen_result.output
-            elif hasattr(gen_result, 'output_text'):
-                text = gen_result.output_text
-            elif isinstance(gen_result, dict):
-                # Look for candidates or text fields
-                if 'candidates' in gen_result and isinstance(gen_result['candidates'], list) and gen_result['candidates']:
-                    cand = gen_result['candidates'][0]
-                    text = cand.get('content') or cand.get('text') or str(cand)
-                else:
-                    # Try common keys
-                    text = gen_result.get('output_text') or gen_result.get('text') or gen_result.get('response')
-            else:
-                # Try string conversion
-                text = str(gen_result)
 
-            return text or str(gen_result)
+            # If object-like with `candidates`
+            if isinstance(gen_result, dict):
+                candidates = gen_result.get("candidates") or gen_result.get("outputs")
+                if isinstance(candidates, list) and candidates:
+                    first = candidates[0]
+                    # candidate may be string or dict with `content`/`text`
+                    if isinstance(first, str):
+                        text = first
+                    elif isinstance(first, dict):
+                        text = first.get("content") or first.get("text") or first.get("output")
+                # Fallback keys
+                text = text or gen_result.get("output_text") or gen_result.get("text") or gen_result.get("response")
+
+            # If object has attributes
+            if text is None:
+                # Some client libs return objects with `.output` or `.candidates`
+                try:
+                    if hasattr(gen_result, "output"):
+                        attr = getattr(gen_result, "output")
+                        if isinstance(attr, str):
+                            text = attr
+                        elif isinstance(attr, list) and attr:
+                            first = attr[0]
+                            text = getattr(first, "content", None) or getattr(first, "text", None) or str(first)
+                    if text is None and hasattr(gen_result, "candidates"):
+                        cand = getattr(gen_result, "candidates")
+                        if isinstance(cand, list) and cand:
+                            first = cand[0]
+                            text = getattr(first, "content", None) or getattr(first, "text", None) or str(first)
+                except Exception:
+                    pass
+
+            # Final fallback to string conversion
+            if text is None:
+                try:
+                    text = str(gen_result)
+                except Exception:
+                    text = None
+
+            return text or "(No textual content returned by Gemini)"
 
         except Exception as e:
             logger.warning(f"Gemini call failed: {e}")
@@ -332,59 +389,79 @@ async def get_ai_recommendation(data_type, formatted_data):
     except Exception as e:
         logger.info(f"google-generativeai not available or failed to import: {e}")
 
-    # --- Fallback: use CrewAI agents as before ---
-    logger.info("Falling back to CrewAI agent for recommendation")
-    try:
-        llm_model = initialize_llm()
+    # --- Fallback: use a local rule-based recommender to avoid external API failures ---
+    logger.info("Falling back to local rule-based recommendation")
 
-        # Configure agent based on data type (reuse original descriptions)
+    def simple_rule_based_recommendation(data_type: str, text: str) -> str:
+        import re
+
+        if not text or not isinstance(text, str):
+            return f"No {data_type} data available for recommendation."
+
         if data_type == "flights":
-            role = "AI Flight Analyst"
-            goal = "Analyze flight options and recommend the best one considering price, duration, stops, and overall convenience."
-            backstory = f"AI expert that provides in-depth analysis comparing flight options based on multiple factors."
-            description = (
-                "Recommend the best flight from the available options, based on the details provided below:\n"
-                "Provide reasoning for price, duration, stops, and travel class."
-            )
+            # Extract flights blocks and parse price, stops, duration
+            flight_blocks = re.split(r"\*\*Flight \d+:", text)[1:]
+            parsed = []
+            for block in flight_blocks:
+                price_m = re.search(r"\$?(\d{1,6})", block)
+                stops_m = re.search(r"(Nonstop|\d+ stop)", block)
+                duration_m = re.search(r"(\d+) min", block)
+                airline_m = re.search(r"Airline:\*\*\s*(\w+)", block)
+                price = int(price_m.group(1)) if price_m else float('inf')
+                stops = stops_m.group(1) if stops_m else "Unknown"
+                duration = int(duration_m.group(1)) if duration_m else 99999
+                airline = airline_m.group(1) if airline_m else "Unknown"
+                parsed.append({"price": price, "stops": stops, "duration": duration, "airline": airline, "block": block.strip()})
+
+            if not parsed:
+                return "No structured flight details available to recommend from."
+
+            # Prefer nonstop then lowest price then shortest duration
+            def score(f):
+                nonstop_bonus = 0 if 'Nonstop' in f['stops'] else 1
+                return (nonstop_bonus, f['price'], f['duration'])
+
+            best = sorted(parsed, key=score)[0]
+            reasoning = [
+                f"Selected flight with airline {best['airline']}",
+                f"Price: ${best['price']}",
+                f"Stops: {best['stops']}",
+                f"Duration: {best['duration']} min",
+            ]
+            return "Recommended Flight:\n- " + "\n- ".join(reasoning) + "\n\n(Recommendation generated by a local rule-based fallback.)"
+
+        elif data_type == "hotels":
+            # Parse hotels for rating and price
+            hotel_blocks = re.split(r"\*\*Hotel \d+:", text)[1:]
+            parsed = []
+            for block in hotel_blocks:
+                price_m = re.search(r"\$?(\d{1,6})", block)
+                rating_m = re.search(r"(\d(?:\.\d)?)", block)
+                name_m = re.search(r"Name:\*\*\s*(.*?)\n", block)
+                price = int(price_m.group(1)) if price_m else float('inf')
+                rating = float(rating_m.group(1)) if rating_m else 0.0
+                name = name_m.group(1).strip() if name_m else "Unknown"
+                parsed.append({"price": price, "rating": rating, "name": name, "block": block.strip()})
+
+            if not parsed:
+                return "No structured hotel details available to recommend from."
+
+            # Prefer highest rating then lowest price
+            best = sorted(parsed, key=lambda h: (-h['rating'], h['price']))[0]
+            reasoning = [
+                f"Selected hotel: {best['name']}",
+                f"Rating: {best['rating']}",
+                f"Price per night: ${best['price']}",
+            ]
+            return "Recommended Hotel:\n- " + "\n- ".join(reasoning) + "\n\n(Recommendation generated by a local rule-based fallback.)"
+
         else:
-            role = "AI Hotel Analyst"
-            goal = "Analyze hotel options and recommend the best one considering price, rating, location, and amenities."
-            backstory = f"AI expert that provides in-depth analysis comparing hotel options based on multiple factors."
-            description = (
-                "Based on the following analysis, generate a detailed recommendation for the best hotel."
-            )
+            return "Invalid data type for recommendation."
 
-        analyze_agent = Agent(
-            role=role,
-            goal=goal,
-            backstory=backstory,
-            llm=llm_model,
-            verbose=False
-        )
-
-        analyze_task = Task(
-            description=f"{description}\n\nData to analyze:\n{formatted_data}",
-            agent=analyze_agent,
-            expected_output=f"A structured recommendation explaining the best {data_type} choice based on the analysis of provided details."
-        )
-
-        analyst_crew = Crew(
-            agents=[analyze_agent],
-            tasks=[analyze_task],
-            process=Process.sequential,
-            verbose=False
-        )
-
-        crew_results = await asyncio.to_thread(analyst_crew.kickoff)
-
-        if hasattr(crew_results, 'outputs') and crew_results.outputs:
-            return crew_results.outputs[0]
-        elif hasattr(crew_results, 'get'):
-            return crew_results.get(role, f"No {data_type} recommendation available.")
-        else:
-            return str(crew_results)
+    try:
+        return simple_rule_based_recommendation(data_type, formatted_data)
     except Exception as e:
-        logger.exception(f"Error in fallback AI {data_type} analysis: {str(e)}")
+        logger.exception(f"Local fallback recommender failed: {e}")
         return f"Unable to generate {data_type} recommendation due to an error."
 
 
